@@ -1,0 +1,206 @@
+"""Test Python parser"""
+
+import sys
+
+import astroid
+import pytest
+
+from autoapi._parser import Parser
+
+
+class TestPythonParser:
+    def parse(self, source):
+        node = astroid.extract_node(source)
+        return Parser().parse(node)
+
+    def test_parses_basic_file(self):
+        source = """
+        def foo(bar):
+            pass
+        """
+        data = self.parse(source)[0]
+        assert data["name"] == "foo"
+        assert data["type"] == "function"
+
+    def test_parses_all(self):
+        source = """
+        __all__ = ['Foo', 5.0]
+        """
+        data = self.parse(source)[0]
+        assert data["name"] == "__all__"
+        assert data["value"] == "['Foo', 5.0]"
+
+    def test_parses_all_multiline(self):
+        source = """
+        __all__ = [
+            'foo',
+            'bar',
+        ]
+        """
+        data = self.parse(source)[0]
+        assert data["value"] == "['foo', 'bar']"
+
+    def test_parses_name(self):
+        source = "foo.bar"
+        assert self.parse(source) == []
+
+    def test_parses_list(self):
+        name = "__all__"
+        value = "[1, 2, 3, 4]"
+        source = f"{name} = {value}"
+        data = self.parse(source)[0]
+        assert data["name"] == name
+        assert data["value"] == value
+
+    def test_parses_nested_list(self):
+        name = "__all__"
+        value = "[[1, 2], [3, 4]]"
+        source = f"{name} = {value}"
+        data = self.parse(source)[0]
+        assert data["name"] == name
+        assert data["value"] == value
+
+    def test_arguments(self):
+        """Argument parsing of source"""
+        source = (
+            "def foobar(self, bar, baz=42, foo=True,\n"
+            "           *args, **kwargs):\n"
+            '    "This is a docstring"\n'
+            "    return True\n"
+        )
+        data = self.parse(source)[0]
+        expected = [
+            (None, "self", None, None),
+            (None, "bar", None, None),
+            (None, "baz", None, "42"),
+            (None, "foo", None, "True"),
+            ("*", "args", None, None),
+            ("**", "kwargs", None, None),
+        ]
+        assert data["args"] == expected
+
+    def test_advanced_arguments(self):
+        """Advanced argument parsing"""
+        source = (
+            'def foobar(self, a, b, c=42, d="string", e=(1,2),\n'
+            '           f={"a": True}, g=None, h=[1,2,3,4],\n'
+            "           i=dict(a=True), j=False, *args, **kwargs):\n"
+            '    "This is a docstring"\n'
+            "    return True\n"
+        )
+        data = self.parse(source)[0]
+        expected = [
+            (None, "self", None, None),
+            (None, "a", None, None),
+            (None, "b", None, None),
+            (None, "c", None, "42"),
+            (None, "d", None, "'string'"),
+            (None, "e", None, "(1, 2)"),
+            (None, "f", None, "{'a': True}"),
+            (None, "g", None, "None"),
+            (None, "h", None, "[1, 2, 3, 4]"),
+            (None, "i", None, "dict(a=True)"),
+            (None, "j", None, "False"),
+            ("*", "args", None, None),
+            ("**", "kwargs", None, None),
+        ]
+        assert data["args"] == expected
+
+    def test_dict_key_assignment(self):
+        """Ignore assignment to dictionary entries."""
+        source = """
+        MY_DICT = {}  #@
+        if condition:
+            MY_DICT['key'] = 'value'
+        MY_DICT['key2'] = 'value2'
+        """
+        data = self.parse(source)[0]
+        assert data["name"] == "MY_DICT"
+
+    def test_list_index_assignment(self):
+        """Ignore assignment to indexes."""
+        source = """
+        COLOUR = [255, 128, 0]  #@
+        if condition:
+            COLOUR[1] = 255
+        COLOUR[2] = 255
+        """
+        data = self.parse(source)[0]
+        assert data["name"] == "COLOUR"
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 12), reason="Type params are supported in Python 3.12+"
+    )
+    def test_parses_typeparams(self):
+        """Check PEP 695 style type params are parsed"""
+        source = """
+        def generic_fn[T](val:T) -> T:
+            pass
+        """
+        data = self.parse(source)[0]
+        assert data["name"] == "generic_fn"
+        assert data["type"] == "function"
+        assert "type_params" in data
+        assert len(data["type_params"]) == 1
+        param = data["type_params"][0]
+        assert param.name == "T"
+        assert param.annotation is None
+
+    def test_parses_nested_subclass_of_outer_class(self):
+        """Check a nested class that inherits from its enclosing class is parsed.
+
+        Regression test for https://github.com/readthedocs/sphinx-autoapi/issues/571
+        """
+        source = """
+        class Outer:
+            def method(self):
+                pass
+
+            class Inner(Outer):
+                pass
+        """
+        data = self.parse(source)[0]
+        assert data["name"] == "Outer"
+        children = {child["name"]: child for child in data["children"]}
+        inner = children["Inner"]
+        assert inner["type"] == "class"
+        assert inner["bases"] == ["Outer"]
+        inner_children = {child["name"] for child in inner["children"]}
+        assert "method" in inner_children
+
+    @pytest.mark.parametrize(
+        "guard",
+        [
+            'if __name__ == "__main__":',
+            "if __name__ == '__main__':",
+            'if "__main__" == __name__:',
+        ],
+    )
+    def test_ignores_main_guard(self, guard):
+        """Check code under ``if __name__ == "__main__":`` is not documented.
+
+        Regression test for https://github.com/readthedocs/sphinx-autoapi/issues/429
+        """
+        source = f'''
+def normal_function():
+    """Documented."""
+
+{guard}
+    def new_example():
+        """Only runs as a script."""
+
+    this_variable_is_ignored = 52
+'''
+        data = Parser().parse(astroid.parse(source))
+        assert [child["name"] for child in data["children"]] == ["normal_function"]
+
+    def test_keeps_other_conditional_definitions(self):
+        source = '''
+import sys
+
+if sys.version_info >= (3, 8):
+    def versioned():
+        """Documented."""
+'''
+        data = Parser().parse(astroid.parse(source))
+        assert [child["name"] for child in data["children"]] == ["versioned"]
